@@ -696,6 +696,15 @@ class DeepseekV3Attention(nn.Module):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.softmax_scale = self.softmax_scale * mscale * mscale
 
+        self.compress_type = nsa_config.compress_type
+        self.kernel_size = nsa_config.kernel_size
+        self.kernel_stride = nsa_config.kernel_stride
+        self.block_size = nsa_config.block_size
+        self.topk = nsa_config.topk
+        self.init_blocks = nsa_config.init_blocks
+        self.local_blocks = nsa_config.local_blocks
+        self.window_size = nsa_config.window_size
+
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = DeepseekV3RotaryEmbedding(
@@ -748,6 +757,8 @@ class DeepseekV3Attention(nn.Module):
             .transpose(1, 2)
             .contiguous()
         )
+    
+    ##TODO NSA
 
     def forward(
         self,
@@ -813,7 +824,7 @@ class DeepseekV3Attention(nn.Module):
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
-
+        
         attn_weights = (
             torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
         )
@@ -854,7 +865,7 @@ class DeepseekV3Attention(nn.Module):
 
         if not output_attentions:
             attn_weights = None
-
+        
         return attn_output, attn_weights, past_key_value
 
 
@@ -1043,7 +1054,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         local_blocks,
         window_size,
     ):
-        ##TODO: IMPLEMENT NSA##
+        ##TODO: NSA##
         attn_output = self._flash_attention_forward_nsa(
             query_states,
             key_states,
