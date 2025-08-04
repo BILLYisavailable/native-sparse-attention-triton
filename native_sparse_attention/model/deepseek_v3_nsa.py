@@ -58,6 +58,9 @@ from .configuration_deepseek import DeepseekV3Config
 import torch.distributed as dist
 import numpy as np
 
+##WYX##
+from native_sparse_attention.module import NativeSparseAttention, RopeConfig, NSACache, NSAConfig
+
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
@@ -626,7 +629,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class DeepseekV3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: DeepseekV3Config, layer_idx: Optional[int] = None):
+    def __init__(self, nsa_config: NSAConfig, config: DeepseekV3Config, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -863,13 +866,21 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
     flash attention and deal with padding tokens in case the input contains any of them.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, nsa_config: NSAConfig, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
         # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
         self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+        self.compress_type = nsa_config.compress_type
+        self.kernel_size = nsa_config.kernel_size
+        self.kernel_stride = nsa_config.kernel_stride
+        self.block_size = nsa_config.block_size
+        self.topk = nsa_config.topk
+        self.init_blocks = nsa_config.init_blocks
+        self.local_blocks = nsa_config.local_blocks
+        self.window_size = nsa_config.window_size
 
     def forward(
         self,
@@ -984,14 +995,22 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
 
-        attn_output = self._flash_attention_forward(
+        attn_output = self._flash_attention_forward_nsa(
             query_states,
             key_states,
             value_states,
             attention_mask,
             q_len,
-            dropout=dropout_rate,
-            softmax_scale=self.softmax_scale,
+            dropout_rate,
+            self.softmax_scale,
+            self.compress_type,
+            self.kernel_size,
+            self.kernel_stride,
+            self.block_size,
+            self.topk,
+            self.init_blocks,
+            self.local_blocks,
+            self.window_size,
         )
         if self.q_head_dim != self.v_head_dim:
             attn_output = attn_output[:, :, :, : self.v_head_dim]
@@ -1005,6 +1024,36 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+    ##WYX##
+    def _flash_attention_forward_nsa(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        query_length,
+        dropout_rate=0.0,
+        softmax_scale=None,
+        compress_type,
+        kernel_size,
+        kernel_stride,
+        block_size,
+        topk,
+        init_blocks,
+        local_blocks,
+        window_size,
+    ):
+        ##TODO: IMPLEMENT NSA##
+        attn_output = self._flash_attention_forward_nsa(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            query_length,
+            dropout_rate,
+            softmax_scale,
+        )
+        return attn_output
 
     def _flash_attention_forward(
         self,
@@ -1138,12 +1187,12 @@ ATTENTION_CLASSES = {
 
 
 class DeepseekV3DecoderLayer(nn.Module):
-    def __init__(self, config: DeepseekV3Config, layer_idx: int):
+    def __init__(self, nsa_config: NSAConfig, config: DeepseekV3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
         self.self_attn = ATTENTION_CLASSES[config._attn_implementation](
-            config=config, layer_idx=layer_idx
+            nsa_config=nsa_config, config=config, layer_idx=layer_idx
         )
 
         self.mlp = (
@@ -1332,9 +1381,10 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`DeepseekV3DecoderLayer`]
     Args:
         config: DeepseekV3Config
+        nsa_config: NSAConfig
     """
 
-    def __init__(self, config: DeepseekV3Config):
+    def __init__(self, nsa_config: NSAConfig, config: DeepseekV3Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -1344,7 +1394,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                DeepseekV3DecoderLayer(config, layer_idx)
+                DeepseekV3DecoderLayer(nsa_config, config, layer_idx)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -1497,9 +1547,9 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, nsa_config):
         super().__init__(config)
-        self.model = DeepseekV3Model(config)
+        self.model = DeepseekV3Model(nsa_config, config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -1707,10 +1757,10 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
     DeepseekV3_START_DOCSTRING,
 )
 class DeepseekV3ForSequenceClassification(DeepseekV3PreTrainedModel):
-    def __init__(self, config):
+    def __init__(self, config, nsa_config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.model = DeepseekV3Model(config)
+        self.model = DeepseekV3Model(nsa_config, config)
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
 
         # Initialize weights and apply final processing
