@@ -123,7 +123,9 @@ class ToyLlamaLayer(nn.Module):
 
 class ToyLlama(nn.Module):
     def __init__(
-        self, config: ToyLlamaConfig, inference_config: Optional[InferenceConfig] = None
+        self, 
+        config: ToyLlamaConfig, 
+        inference_config: Optional[InferenceConfig] = None
     ):
         super().__init__()
         self.config = config
