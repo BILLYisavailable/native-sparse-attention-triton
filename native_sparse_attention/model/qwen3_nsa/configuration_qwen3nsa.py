@@ -14,15 +14,15 @@
 # limitations under the License.
 """Qwen3 model configuration"""
 
-from ...configuration_utils import PretrainedConfig, layer_type_validation
-from ...modeling_rope_utils import rope_config_validation
-from ...utils import logging
+from transformers.configuration_utils import PretrainedConfig, layer_type_validation
+from transformers.modeling_rope_utils import rope_config_validation
+from transformers.utils import logging
 
 
 logger = logging.get_logger(__name__)
 
 
-class Qwen3Config(PretrainedConfig):
+class Qwen3NSAConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3Model`]. It is used to instantiate a
     Qwen3 model according to the specified arguments, defining the model architecture. Instantiating a configuration
