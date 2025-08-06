@@ -24,8 +24,8 @@ logger = logging.get_logger(__name__)
 
 class Qwen3NSAConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`Qwen3Model`]. It is used to instantiate a
-    Qwen3 model according to the specified arguments, defining the model architecture. Instantiating a configuration
+    This is the configuration class to store the configuration of a [`Qwen3NSAModel`]. It is used to instantiate a
+    Qwen3NSA model according to the specified arguments, defining the model architecture. Instantiating a configuration
     with the defaults will yield a similar configuration to that of
     Qwen3-8B [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B).
 
@@ -119,6 +119,15 @@ class Qwen3NSAConfig(PretrainedConfig):
             Attention pattern for each layer.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             The dropout ratio for the attention probabilities.
+        NSA Configs:
+        nsa_compress_type ('str')
+        nsa_kernel_size ('int')
+        nsa_kernel_stride ('int')
+        nsa_block_size ('int')
+        nsa_topk ('int')
+        nsa_init_blocks ('int')
+        nsa_local_blocks ('int')
+        nsa_window_size ('int')
 
     ```python
     >>> from transformers import Qwen3Model, Qwen3Config
@@ -133,7 +142,7 @@ class Qwen3NSAConfig(PretrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "qwen3"
+    model_type = "qwen3nsa"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     # Default tensor parallel plan for base model `Qwen3`
@@ -175,6 +184,14 @@ class Qwen3NSAConfig(PretrainedConfig):
         max_window_layers=28,
         layer_types=None,
         attention_dropout=0.0,
+        nsa_compress_type="weightedpool",
+        nsa_kernel_size=32,
+        nsa_kernel_stride=16,
+        nsa_block_size=64,
+        nsa_topk=16,
+        nsa_init_blocks=1,
+        nsa_local_blocks=2,
+        nsa_window_size=512,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -201,6 +218,16 @@ class Qwen3NSAConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+
+        self.nsa_compress_type = nsa_compress_type
+        self.nsa_kernel_size = nsa_kernel_size
+        self.nsa_kernel_stride = nsa_kernel_stride
+        self.nsa_block_size = nsa_block_size
+        self.nsa_topk = nsa_topk
+        self.nsa_init_blocks = nsa_init_blocks
+        self.nsa_local_blocks = nsa_local_blocks
+        self.nsa_window_size = nsa_window_size
+
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
@@ -223,4 +250,4 @@ class Qwen3NSAConfig(PretrainedConfig):
         )
 
 
-__all__ = ["Qwen3Config"]
+__all__ = ["Qwen3NSAConfig"]
