@@ -281,7 +281,7 @@ class Qwen3NSAPreTrainedModel(PreTrainedModel):
     config: Qwen3NSAConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["Qwen3DecoderLayer"]
+    _no_split_modules = ["QwenNSA3DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
@@ -290,8 +290,8 @@ class Qwen3NSAPreTrainedModel(PreTrainedModel):
     _can_compile_fullgraph = True
     _supports_attention_backend = True
     _can_record_outputs = {
-        "hidden_states": Qwen3DecoderLayer,
-        "attentions": Qwen3Attention,
+        "hidden_states": Qwen3NSADecoderLayer,
+        "attentions": Qwen3NSAAttention,
     }
 
 
