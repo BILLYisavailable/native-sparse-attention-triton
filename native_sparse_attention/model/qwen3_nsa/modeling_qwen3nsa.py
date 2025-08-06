@@ -156,7 +156,7 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-class Qwen3Attention(nn.Module):
+class Qwen3NSAAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: Qwen3NSAConfig, layer_idx: int):
@@ -230,12 +230,12 @@ class Qwen3Attention(nn.Module):
         return attn_output, attn_weights
 
 
-class Qwen3DecoderLayer(GradientCheckpointingLayer):
+class Qwen3NSADecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3NSAConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
+        self.self_attn = Qwen3NSAAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -277,7 +277,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
 
 
 @auto_docstring
-class Qwen3PreTrainedModel(PreTrainedModel):
+class Qwen3NSAPreTrainedModel(PreTrainedModel):
     config: Qwen3NSAConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -330,7 +330,7 @@ class Qwen3RotaryEmbedding(nn.Module):
 
 
 @auto_docstring
-class Qwen3Model(Qwen3PreTrainedModel):
+class Qwen3NSAModel(Qwen3NSAPreTrainedModel):
     def __init__(self, config: Qwen3NSAConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -338,7 +338,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen3NSADecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
@@ -423,14 +423,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
 
 @auto_docstring
-class Qwen3NSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
+class Qwen3NSAForCausalLM(Qwen3NSAPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3Model(config)
+        self.model = Qwen3NSAModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -467,10 +467,11 @@ class Qwen3NSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, Qwen3ForCausalLM
+        >>> from transformers import AutoTokenizer
+        >>> from modeling_qwen3nsa import Qwen3NSAForCausalLM
 
-        >>> model = Qwen3ForCausalLM.from_pretrained("Qwen/Qwen3-8B")
-        >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+        >>> model = Qwen3NSAForCausalLM.from_pretrained("./")
+        >>> tokenizer = AutoTokenizer.from_pretrained("./")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
@@ -509,23 +510,23 @@ class Qwen3NSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
 
-class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):
+class Qwen3NSAForSequenceClassification(GenericForSequenceClassification, Qwen3NSAPreTrainedModel):
     pass
 
 
-class Qwen3ForTokenClassification(GenericForTokenClassification, Qwen3PreTrainedModel):
+class Qwen3NSAForTokenClassification(GenericForTokenClassification, Qwen3NSAPreTrainedModel):
     pass
 
 
-class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3PreTrainedModel):
+class Qwen3NSAForQuestionAnswering(GenericForQuestionAnswering, Qwen3NSAPreTrainedModel):
     base_model_prefix = "transformer"  # For BC, where `transformer` was used instead of `model`
 
 
 __all__ = [
-    "Qwen3ForCausalLM",
-    "Qwen3ForQuestionAnswering",
-    "Qwen3PreTrainedModel",
-    "Qwen3Model",
-    "Qwen3ForSequenceClassification",
-    "Qwen3ForTokenClassification",
+    "Qwen3NSAForCausalLM",
+    "Qwen3NSAForQuestionAnswering",
+    "Qwen3NSAPreTrainedModel",
+    "Qwen3NSAModel",
+    "Qwen3NSAForSequenceClassification",
+    "Qwen3NSAForTokenClassification",
 ]
