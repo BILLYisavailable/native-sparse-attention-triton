@@ -44,7 +44,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import check_model_inputs
-from configuration_qwen3nsa import Qwen3NSAConfig
+from .configuration_qwen3nsa import Qwen3NSAConfig
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -281,7 +281,7 @@ class Qwen3NSAPreTrainedModel(PreTrainedModel):
     config: Qwen3NSAConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["QwenNSA3DecoderLayer"]
+    _no_split_modules = ["Qwen3NSADecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
