@@ -226,12 +226,13 @@ class Qwen3NSAAttention(nn.Module):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
+        
+        assert self.config._attn_implementation=="flash_attention_2"
+        # attention_interface: Callable = eager_attention_forward
+        # if self.config._attn_implementation != "eager":
+        #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        ##TODO: Transform to flash attention
+        attn_output, attn_weights = eager_attention_forward(
             self,
             query_states,
             key_states,
