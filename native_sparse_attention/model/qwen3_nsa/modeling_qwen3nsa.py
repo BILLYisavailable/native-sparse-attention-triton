@@ -155,6 +155,20 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
+COMPRESS_TYPE_TO_FUNC = {
+    "avgpool": avgpool_compress,
+    "weightedpool": weightedpool_compress,
+    "linear": linear_compress,
+}
+COMPRESS_TYPE_TO_WEIGHT = {
+    "avgpool": lambda num_heads, head_dim, kernel_size: None,
+    "weightedpool": lambda num_heads, head_dim, kernel_size: torch.nn.Parameter(
+        torch.zeros(num_heads, kernel_size)
+    ),
+    "linear": lambda num_heads, head_dim, kernel_size: torch.nn.Parameter(
+        torch.zeros(num_heads, head_dim * kernel_size, head_dim)
+    ),
+}
 
 class Qwen3NSAAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -184,7 +198,11 @@ class Qwen3NSAAttention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-
+        self.nsa_compress_func = COMPRESS_TYPE_TO_FUNC[self.config.nsa_compress_type]
+        
+        
+        
+        
     def forward(
         self,
         hidden_states: torch.Tensor,
