@@ -213,7 +213,8 @@ class Qwen3NSAAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-
+        
+        
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -226,11 +227,16 @@ class Qwen3NSAAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         
+        # key_states, value_states: [batch_size, head, seqlen, head_dim]
+        # head = 8, 32, head_dim = 128
+        # hidden_states: [batch_size, , ] = [batch_size, 1, 4096]
+        
         assert self.config._attn_implementation=="flash_attention_2"
         # attention_interface: Callable = eager_attention_forward
         # if self.config._attn_implementation != "eager":
         #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         ##TODO: Transform to flash attention
+        ##TODO: Compress first, Flash last
         # attn_output, attn_weights = eager_attention_forward(
         #     self,
         #     query_states,
@@ -242,13 +248,15 @@ class Qwen3NSAAttention(nn.Module):
         #     sliding_window=self.sliding_window,  # diff with Llama
         #     **kwargs,
         # )
-        gate = self.gate(hidden_states)
-        gate = gate.reshape(gate.shape[0], -1, 3)
+        gate = self.gate(hidden_states) # [4, 1, 4096]
+        gate = gate.reshape(gate.shape[0], -1, 3) # [4, 1, 4096, 3]
         attn_output = (
             gate[..., 0:1] * compressed_attn_output
             + gate[..., 1:2] * sparse_attn_output
             + gate[..., 2:3] * sliding_attn_output
         )
+        
+        # attn_output: [batch_size, seqlen, head, head_dim] = [batch_size, 1, 32, 128]
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
