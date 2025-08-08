@@ -199,8 +199,7 @@ class Qwen3NSAAttention(nn.Module):
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
         self.nsa_compress_func = COMPRESS_TYPE_TO_FUNC[self.config.nsa_compress_type]
-        
-        
+
         
         
     def forward(
@@ -232,18 +231,24 @@ class Qwen3NSAAttention(nn.Module):
         # if self.config._attn_implementation != "eager":
         #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         ##TODO: Transform to flash attention
-        attn_output, attn_weights = eager_attention_forward(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
+        # attn_output, attn_weights = eager_attention_forward(
+        #     self,
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     attention_mask,
+        #     dropout=0.0 if not self.training else self.attention_dropout,
+        #     scaling=self.scaling,
+        #     sliding_window=self.sliding_window,  # diff with Llama
+        #     **kwargs,
+        # )
+        gate = self.gate(hidden_states)
+        gate = gate.reshape(gate.shape[0], -1, 3)
+        attn_output = (
+            gate[..., 0:1] * compressed_attn_output
+            + gate[..., 1:2] * sparse_attn_output
+            + gate[..., 2:3] * sliding_attn_output
         )
-
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
