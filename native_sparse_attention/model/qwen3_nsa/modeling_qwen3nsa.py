@@ -155,6 +155,16 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
+##TODO: compress functions 
+def avgpool_compress():
+    
+    
+def weightedpool_compress():
+
+
+def linear_compress():
+
+
 COMPRESS_TYPE_TO_FUNC = {
     "avgpool": avgpool_compress,
     "weightedpool": weightedpool_compress,
@@ -199,14 +209,17 @@ class Qwen3NSAAttention(nn.Module):
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
         self.nsa_gate_proj = torch.nn.Sequential(
-            torch.nn.Linear(config.hidden_size, config.num_attention_heads * 3, bias=False),
+            torch.nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim * 3, bias=False),
             torch.nn.Sigmoid(),
         )
-
-        self.nsa_compress_func = COMPRESS_TYPE_TO_FUNC[self.config.nsa_compress_type]
-
-        
-        
+        self.compress_key = COMPRESS_TYPE_TO_WEIGHT[self.compress_type](
+            config.num_key_value_heads, self.head_dim, self.config.nsa_kernel_size
+        )
+        self.compress_value = COMPRESS_TYPE_TO_WEIGHT[self.compress_type](
+            config.num_key_value_heads, self.head_dim, self.config.nsa_kernel_size
+        )
+        self.nsa_compress_func = COMPRESS_TYPE_TO_FUNC[self.config.nsa_compress_type]    
+    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -236,25 +249,74 @@ class Qwen3NSAAttention(nn.Module):
         # head = 8, 32, head_dim = 128
         # hidden_states: [batch_size, 1, hidden_size] = [4, 1, 4096]
         
-        assert self.config._attn_implementation=="eager"
+        # assert self.config._attn_implementation=="flash_attention_2"
         # attention_interface: Callable = eager_attention_forward
         # if self.config._attn_implementation != "eager":
         #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         ##TODO: Transform to flash attention
         ##TODO: Compress first, Flash last
-        attn_output, attn_weights = eager_attention_forward(
-            self,
+        # attn_output, attn_weights = eager_attention_forward(
+        #     self,
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     attention_mask,
+        #     dropout=0.0 if not self.training else self.attention_dropout,
+        #     scaling=self.scaling,
+        #     sliding_window=self.sliding_window,  # diff with Llama
+        #     **kwargs,
+        # )
+
+        compressed_key_states, compressed_cu_seqlens = self.nsa_compress_func(
+            key_states,
+            self.compress_key,
+            cu_seqlens,
+            self.kernel_size,
+            self.kernel_stride,
+            self.intra_block_pe,
+        )
+        compressed_v, _ = self.nsa_compress_func(
+            value_states,
+            self.compress_value,
+            cu_seqlens,
+            self.kernel_size,
+            self.kernel_stride,
+            None,
+        )
+        
+        compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
+        compressed_attn_output, topk_idx = compressed_attention(
+            query_states,
+            compressed_key_states,
+            compressed_value_states,
+            self.kernel_size,
+            self.kernel_stride,
+            self.block_size,
+            self.topk,
+            cu_seqlens,
+            compressed_cu_seqlens,
+            seqlens.max().item(),
+            compressed_seqlens.max().item(),
+            None,
+            self.init_blocks,
+            self.local_blocks,
+        )
+        sparse_attn_output = topk_sparse_attention(
+            query_states, key_states, value_states, topk_idx, self.config.nsa_block_size, cu_seqlens, None
+        )
+        sliding_attn_output = flash_attn_varlen_func(
             query_states,
             key_states,
             value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
+            cu_seqlens,
+            compressed_cu_seqlens,
+            seqlens.max().item(),
+            seqlens_compressed.max().item(),
+            causal=True,
+            window_size=(self.window_size, -1),
         )
         
-
+        
         gate = self.nsa_gate_proj(hidden_states)  # [batch, 1, 32 * 128 * 3] = [4, 1, 12288]
         gate = gate.view(hidden_states.shape[0], hidden_states.shape[1], self.config.num_attention_heads, self.head_dim, 3)
         gate = torch.ones(
@@ -267,9 +329,9 @@ class Qwen3NSAAttention(nn.Module):
             dtype=hidden_states.dtype,
         )
         attn_output = (
-            gate[..., 0:1] * attn_output
-            + gate[..., 1:2] * attn_output
-            + gate[..., 2:3] * attn_output
+            gate[..., 0:1].squeeze(-1) * compressed_attn_output +
+            gate[..., 1:2].squeeze(-1) * sparse_attn_output +
+            gate[..., 2:3].squeeze(-1) * sliding_attn_output
         )
         
         # attn_output: [batch_size, 1, head, head_dim] = [4, 1, 32, 128]
