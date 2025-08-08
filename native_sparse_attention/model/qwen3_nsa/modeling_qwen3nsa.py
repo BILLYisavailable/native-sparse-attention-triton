@@ -198,6 +198,11 @@ class Qwen3NSAAttention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+        self.nsa_gate_proj = torch.nn.Sequential(
+            torch.nn.Linear(config.hidden_size, config.num_attention_heads * 3, bias=False),
+            torch.nn.Sigmoid(),
+        )
+
         self.nsa_compress_func = COMPRESS_TYPE_TO_FUNC[self.config.nsa_compress_type]
 
         
@@ -229,34 +234,44 @@ class Qwen3NSAAttention(nn.Module):
         
         # key_states, value_states: [batch_size, head, seqlen, head_dim]
         # head = 8, 32, head_dim = 128
-        # hidden_states: [batch_size, , ] = [batch_size, 1, 4096]
+        # hidden_states: [batch_size, 1, hidden_size] = [4, 1, 4096]
         
-        assert self.config._attn_implementation=="flash_attention_2"
+        assert self.config._attn_implementation=="eager"
         # attention_interface: Callable = eager_attention_forward
         # if self.config._attn_implementation != "eager":
         #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         ##TODO: Transform to flash attention
         ##TODO: Compress first, Flash last
-        # attn_output, attn_weights = eager_attention_forward(
-        #     self,
-        #     query_states,
-        #     key_states,
-        #     value_states,
-        #     attention_mask,
-        #     dropout=0.0 if not self.training else self.attention_dropout,
-        #     scaling=self.scaling,
-        #     sliding_window=self.sliding_window,  # diff with Llama
-        #     **kwargs,
-        # )
-        gate = self.gate(hidden_states) # [4, 1, 4096]
-        gate = gate.reshape(gate.shape[0], -1, 3) # [4, 1, 4096, 3]
-        attn_output = (
-            gate[..., 0:1] * compressed_attn_output
-            + gate[..., 1:2] * sparse_attn_output
-            + gate[..., 2:3] * sliding_attn_output
+        attn_output, attn_weights = eager_attention_forward(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,  # diff with Llama
+            **kwargs,
         )
         
-        # attn_output: [batch_size, seqlen, head, head_dim] = [batch_size, 1, 32, 128]
+
+        gate = self.nsa_gate_proj(hidden_states)  # [batch, 1, 32 * 128 * 3] = [4, 1, 12288]
+        gate = gate.view(hidden_states.shape[0], hidden_states.shape[1], self.config.num_attention_heads, self.head_dim, 3)
+        attn_output = (
+            gate[..., 0:1] * attn_output
+            + gate[..., 1:2] * attn_output
+            + gate[..., 2:3] * attn_output
+        )
+        gate = torch.ones(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            self.config.num_attention_heads,
+            self.head_dim,
+            3,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        # attn_output: [batch_size, 1, head, head_dim] = [4, 1, 32, 128]
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
