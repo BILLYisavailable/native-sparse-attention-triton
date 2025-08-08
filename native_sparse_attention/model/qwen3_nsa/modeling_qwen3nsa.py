@@ -257,11 +257,6 @@ class Qwen3NSAAttention(nn.Module):
 
         gate = self.nsa_gate_proj(hidden_states)  # [batch, 1, 32 * 128 * 3] = [4, 1, 12288]
         gate = gate.view(hidden_states.shape[0], hidden_states.shape[1], self.config.num_attention_heads, self.head_dim, 3)
-        attn_output = (
-            gate[..., 0:1] * attn_output
-            + gate[..., 1:2] * attn_output
-            + gate[..., 2:3] * attn_output
-        )
         gate = torch.ones(
             hidden_states.shape[0],
             hidden_states.shape[1],
@@ -271,6 +266,12 @@ class Qwen3NSAAttention(nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
+        attn_output = (
+            gate[..., 0:1] * attn_output
+            + gate[..., 1:2] * attn_output
+            + gate[..., 2:3] * attn_output
+        )
+        
         # attn_output: [batch_size, 1, head, head_dim] = [4, 1, 32, 128]
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
