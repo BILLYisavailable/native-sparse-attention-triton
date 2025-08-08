@@ -266,7 +266,9 @@ class Qwen3NSAAttention(nn.Module):
         #     sliding_window=self.sliding_window,  # diff with Llama
         #     **kwargs,
         # )
-
+        
+        ##TODO: Cumulate
+        
         compressed_key_states, compressed_cu_seqlens = self.nsa_compress_func(
             key_states,
             self.compress_key,
