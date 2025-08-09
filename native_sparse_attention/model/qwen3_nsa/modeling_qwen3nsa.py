@@ -180,6 +180,28 @@ COMPRESS_TYPE_TO_WEIGHT = {
     ),
 }
 
+
+def batch2cuseqlen(key_states: torch.Tensor, value_states: torch.Tensor) -> tuple:
+    cu_seqlen = torch.zeros(key_states.size(0), dtype=torch.long)
+    merged_key_states = []
+    merged_value_states = []
+
+    total_seq_len = 0
+    for i in range(key_states.size(0)):
+        valid_length = cu_seqlen[i] = key_states.size(2)
+        total_seq_len += valid_length
+
+        key_sequence = key_states[i, :, :valid_length, :]
+        value_sequence = value_states[i, :, :valid_length, :]
+
+        merged_key_states.append(key_sequence)
+        merged_value_states.append(value_sequence)
+
+    merged_key_states = torch.cat(merged_key_states, dim=2)
+    merged_value_states = torch.cat(merged_value_states, dim=2)
+
+    return merged_key_states, merged_value_states, cu_seqlen
+
 class Qwen3NSAAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -212,10 +234,10 @@ class Qwen3NSAAttention(nn.Module):
             torch.nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim * 3, bias=False),
             torch.nn.Sigmoid(),
         )
-        self.compress_key = COMPRESS_TYPE_TO_WEIGHT[self.compress_type](
+        self.nsa_compress_key = COMPRESS_TYPE_TO_WEIGHT[self.compress_type](
             config.num_key_value_heads, self.head_dim, self.config.nsa_kernel_size
         )
-        self.compress_value = COMPRESS_TYPE_TO_WEIGHT[self.compress_type](
+        self.nsa_compress_value = COMPRESS_TYPE_TO_WEIGHT[self.compress_type](
             config.num_key_value_heads, self.head_dim, self.config.nsa_kernel_size
         )
         self.nsa_compress_func = COMPRESS_TYPE_TO_FUNC[self.config.nsa_compress_type]    
@@ -268,10 +290,11 @@ class Qwen3NSAAttention(nn.Module):
         # )
         
         ##TODO: Cumulate
-        
+        key_states, value_states, cu_seqlen = batch2cuseqlen(key_states, value_states)
+
         compressed_key_states, compressed_cu_seqlens = self.nsa_compress_func(
             key_states,
-            self.compress_key,
+            self.nsa_compress_key,
             cu_seqlens,
             self.kernel_size,
             self.kernel_stride,
@@ -279,7 +302,7 @@ class Qwen3NSAAttention(nn.Module):
         )
         compressed_v, _ = self.nsa_compress_func(
             value_states,
-            self.compress_value,
+            self.nsa_compress_value,
             cu_seqlens,
             self.kernel_size,
             self.kernel_stride,
