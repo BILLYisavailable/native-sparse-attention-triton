@@ -291,7 +291,7 @@ class Qwen3NSAAttention(nn.Module):
         # )
         
         ##TODO: Cumulate
-        key_states, value_states, cu_seqlen = batch2cuseqlen(key_states, value_states)
+        key_states, value_states, cu_seqlen = batch2cuseqlen(key_states, value_states, attention_mask)
 
         compressed_key_states, compressed_cu_seqlens = self.nsa_compress_func(
             key_states,
