@@ -180,16 +180,20 @@ COMPRESS_TYPE_TO_WEIGHT = {
     ),
 }
 
+
 def batch2cuseqlen(key_states: torch.Tensor, value_states: torch.Tensor, attention_mask: torch.Tensor) -> tuple:
     batch_size, num_heads, seq_len, head_dim = key_states.shape
-    cu_seqlen = torch.sum(attention_mask, dim=1)
+
+    attention_mask = attention_mask.squeeze(1).squeeze(1)
+    seqlen = torch.sum(attention_mask, dim=1)
+    cu_seqlen = torch.cat([torch.tensor([0], dtype=seqlen.dtype), torch.cumsum(seqlen, dim=0)])
 
     merged_key_states = []
     merged_value_states = []
 
     total_seq_len = 0
     for i in range(batch_size):
-        valid_length = cu_seqlen[i]
+        valid_length = cu_seqlen[i + 1] - cu_seqlen[i]
         total_seq_len += valid_length
 
         key_sequence = key_states[i, :, :valid_length, :]
@@ -197,8 +201,8 @@ def batch2cuseqlen(key_states: torch.Tensor, value_states: torch.Tensor, attenti
         merged_key_states.append(key_sequence)
         merged_value_states.append(value_sequence)
 
-    merged_key_states = torch.cat(merged_key_states, dim=2)
-    merged_value_states = torch.cat(merged_value_states, dim=2)
+    merged_key_states = torch.cat(merged_key_states, dim=1)
+    merged_value_states = torch.cat(merged_value_states, dim=1)
 
     return merged_key_states, merged_value_states, cu_seqlen
 
