@@ -183,6 +183,7 @@ def batch2cuseqlen(key_states: torch.Tensor, value_states: torch.Tensor, attenti
     batch_size, num_heads, seq_len, head_dim = key_states.shape
 
     attention_mask = attention_mask.squeeze(1).squeeze(1)
+    print(attention_mask)
     seqlen = torch.sum(attention_mask, dim=1).squeeze(0)
     print(seqlen)
     cu_seqlen = torch.cat([torch.tensor([0], dtype=seqlen.dtype), torch.cumsum(seqlen, dim=0)])
@@ -281,25 +282,6 @@ class Qwen3NSAAttention(nn.Module):
         # head = 8, 32, head_dim = 128
         # hidden_states: [batch_size, 1, hidden_size] = [4, 1, 4096]
 
-        # assert self.config._attn_implementation=="flash_attention_2"
-        # attention_interface: Callable = eager_attention_forward
-        # if self.config._attn_implementation != "eager":
-        #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-        ##TODO: Transform to flash attention
-        ##TODO: Compress first, Flash last
-        # attn_output, attn_weights = eager_attention_forward(
-        #     self,
-        #     query_states,
-        #     key_states,
-        #     value_states,
-        #     attention_mask,
-        #     dropout=0.0 if not self.training else self.attention_dropout,
-        #     scaling=self.scaling,
-        #     sliding_window=self.sliding_window,  # diff with Llama
-        #     **kwargs,
-        # )
-
-        ##TODO: Cumulate
         key_states, value_states, cu_seqlens = batch2cuseqlen(key_states, value_states, attention_mask)
 
         compressed_key_states, compressed_cu_seqlens = self.nsa_compress_func(
@@ -310,7 +292,6 @@ class Qwen3NSAAttention(nn.Module):
             self.nsa_kernel_stride,
             None,
         )
-        #TODO: intra block PE
         compressed_value_states, _ = self.nsa_compress_func(
             value_states,
             self.nsa_compress_value,
