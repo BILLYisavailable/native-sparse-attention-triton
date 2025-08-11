@@ -45,8 +45,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import check_model_inputs
 from .configuration_qwen3nsa import Qwen3NSAConfig
-
-
+from .native_sparse_attention.module import NativeSparseAttention, RopeConfig, NSACache
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -155,71 +154,20 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
-##TODO: compress functions 
-def avgpool_compress():
-    
-    
-def weightedpool_compress():
-
-
-def linear_compress():
-
-
-COMPRESS_TYPE_TO_FUNC = {
-    "avgpool": avgpool_compress,
-    "weightedpool": weightedpool_compress,
-    "linear": linear_compress,
-}
-COMPRESS_TYPE_TO_WEIGHT = {
-    "avgpool": lambda num_heads, head_dim, kernel_size: None,
-    "weightedpool": lambda num_heads, head_dim, kernel_size: torch.nn.Parameter(
-        torch.zeros(num_heads, kernel_size)
-    ),
-    "linear": lambda num_heads, head_dim, kernel_size: torch.nn.Parameter(
-        torch.zeros(num_heads, head_dim * kernel_size, head_dim)
-    ),
-}
-
-
-def batch2cuseqlen(key_states: torch.Tensor, value_states: torch.Tensor, attention_mask: torch.Tensor) -> tuple:
-    batch_size, num_heads, seq_len, head_dim = key_states.shape
-
-    attention_mask = attention_mask.squeeze(1).squeeze(1)
-    seqlen = torch.sum(attention_mask, dim=1)
-    cu_seqlen = torch.cat([torch.tensor([0], dtype=seqlen.dtype), torch.cumsum(seqlen, dim=0)])
-
-    merged_key_states = []
-    merged_value_states = []
-
-    total_seq_len = 0
-    for i in range(batch_size):
-        valid_length = cu_seqlen[i + 1] - cu_seqlen[i]
-        total_seq_len += valid_length
-
-        key_sequence = key_states[i, :, :valid_length, :]
-        value_sequence = value_states[i, :, :valid_length, :]
-        merged_key_states.append(key_sequence)
-        merged_value_states.append(value_sequence)
-
-    merged_key_states = torch.cat(merged_key_states, dim=1)
-    merged_value_states = torch.cat(merged_value_states, dim=1)
-
-    return merged_key_states, merged_value_states, cu_seqlen
-
-
 class Qwen3NSAAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    """Multi-headed attention with Native Sparse Attention"""
 
     def __init__(self, config: Qwen3NSAConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
+        # Projection layers for Q, K, V, and output
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
@@ -232,21 +180,32 @@ class Qwen3NSAAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+
+        # Normalization layers
+        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        # Sliding window for attention (if specified)
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-        self.nsa_gate_proj = torch.nn.Sequential(
-            torch.nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim * 3, bias=False),
-            torch.nn.Sigmoid(),
+
+        # Native Sparse Attention
+        self.nsa = NativeSparseAttention(
+            compress_type=config.nsa_compress_type,
+            hidden_size=config.hidden_size,
+            num_q_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=self.head_dim,
+            kernel_size=config.nsa_kernel_size,
+            kernel_stride=config.nsa_kernel_stride,
+            block_size=config.nsa_block_size,
+            topk=config.nsa_topk,
+            init_blocks=config.nsa_init_blocks,
+            local_blocks=config.nsa_local_blocks,
+            window_size=config.nsa_window_size,
+            rope_config=config.rope_scaling,  # Passing rope_config if available
+            rope_device="cuda",  # Assuming it's "cuda", can be customized
         )
-        self.nsa_compress_key = COMPRESS_TYPE_TO_WEIGHT[self.compress_type](
-            config.num_key_value_heads, self.head_dim, self.config.nsa_kernel_size
-        )
-        self.nsa_compress_value = COMPRESS_TYPE_TO_WEIGHT[self.compress_type](
-            config.num_key_value_heads, self.head_dim, self.config.nsa_kernel_size
-        )
-        self.nsa_compress_func = COMPRESS_TYPE_TO_FUNC[self.config.nsa_compress_type]    
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -254,12 +213,11 @@ class Qwen3NSAAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+        **kwargs,
+    ):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        
-        
+
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -271,112 +229,55 @@ class Qwen3NSAAttention(nn.Module):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        
-        # key_states, value_states: [batch_size, head, seqlen, head_dim]
-        # head = 8, 32, head_dim = 128
-        # hidden_states: [batch_size, 1, hidden_size] = [4, 1, 4096]
-        
-        # assert self.config._attn_implementation=="flash_attention_2"
-        # attention_interface: Callable = eager_attention_forward
-        # if self.config._attn_implementation != "eager":
-        #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-        ##TODO: Transform to flash attention
-        ##TODO: Compress first, Flash last
-        # attn_output, attn_weights = eager_attention_forward(
-        #     self,
-        #     query_states,
-        #     key_states,
-        #     value_states,
-        #     attention_mask,
-        #     dropout=0.0 if not self.training else self.attention_dropout,
-        #     scaling=self.scaling,
-        #     sliding_window=self.sliding_window,  # diff with Llama
-        #     **kwargs,
-        # )
-        
-        ##TODO: Cumulate
-        key_states, value_states, cu_seqlen = batch2cuseqlen(key_states, value_states, attention_mask)
 
-        compressed_key_states, compressed_cu_seqlens = self.nsa_compress_func(
-            key_states,
-            self.nsa_compress_key,
-            cu_seqlens,
-            self.kernel_size,
-            self.kernel_stride,
-            self.intra_block_pe,
-        )
-        compressed_v, _ = self.nsa_compress_func(
-            value_states,
-            self.nsa_compress_value,
-            cu_seqlens,
-            self.kernel_size,
-            self.kernel_stride,
-            None,
-        )
-        
-        compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
-        compressed_attn_output, topk_idx = compressed_attention(
-            query_states,
-            compressed_key_states,
-            compressed_value_states,
-            self.kernel_size,
-            self.kernel_stride,
-            self.block_size,
-            self.topk,
-            cu_seqlens,
-            compressed_cu_seqlens,
-            seqlens.max().item(),
-            compressed_seqlens.max().item(),
-            None,
-            self.init_blocks,
-            self.local_blocks,
-        )
-        sparse_attn_output = topk_sparse_attention(
-            query_states, key_states, value_states, topk_idx, self.config.nsa_block_size, cu_seqlens, None
-        )
-        sliding_attn_output = flash_attn_varlen_func(
-            query_states,
-            key_states,
-            value_states,
-            cu_seqlens,
-            compressed_cu_seqlens,
-            seqlens.max().item(),
-            seqlens_compressed.max().item(),
-            causal=True,
-            window_size=(self.window_size, -1),
-        )
-        
-        
-        gate = self.nsa_gate_proj(hidden_states)  # [batch, 1, 32 * 128 * 3] = [4, 1, 12288]
-        gate = gate.view(hidden_states.shape[0], hidden_states.shape[1], self.config.num_attention_heads, self.head_dim, 3)
-        gate = torch.ones(
-            hidden_states.shape[0],
-            hidden_states.shape[1],
-            self.config.num_attention_heads,
-            self.head_dim,
-            3,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        attn_output = (
-            gate[..., 0:1].squeeze(-1) * compressed_attn_output +
-            gate[..., 1:2].squeeze(-1) * sparse_attn_output +
-            gate[..., 2:3].squeeze(-1) * sliding_attn_output
-        )
-        
-        # attn_output: [batch_size, 1, head, head_dim] = [4, 1, 32, 128]
+        attn_output = self.nsa(query_states, key_states, value_states, attention_mask)
+
+
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
 
+    @torch.no_grad()
+    def inference(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        step: int,
+        kv_cache: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        # Compute query, key, value states for inference
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        # Apply rotary positional embeddings
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # Update key/value cache if available (important for autoregressive generation)
+        if kv_cache is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # Use Native Sparse Attention for inference
+        attn_output = self.nsa.inference(query_states, key_states, value_states, step, kv_cache)
+
+        # Reshape and apply output projection
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output
 
 class Qwen3NSADecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3NSAConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
         self.self_attn = Qwen3NSAAttention(config=config, layer_idx=layer_idx)
-
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -396,7 +297,7 @@ class Qwen3NSADecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states = self.self_attn(
+        hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
