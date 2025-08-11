@@ -183,7 +183,8 @@ def batch2cuseqlen(key_states: torch.Tensor, value_states: torch.Tensor, attenti
     batch_size, num_heads, seq_len, head_dim = key_states.shape
 
     attention_mask = attention_mask.squeeze(1).squeeze(1)
-    seqlen = torch.sum(attention_mask, dim=1)
+    seqlen = torch.sum(attention_mask, dim=1).squeeze(0)
+    print(seqlen)
     cu_seqlen = torch.cat([torch.tensor([0], dtype=seqlen.dtype), torch.cumsum(seqlen, dim=0)])
 
     merged_key_states = []
@@ -245,6 +246,12 @@ class Qwen3NSAAttention(nn.Module):
             config.num_key_value_heads, self.head_dim, self.config.nsa_kernel_size
         )
         self.nsa_compress_func = COMPRESS_TYPE_TO_FUNC[self.config.nsa_compress_type]
+        self.nsa_kernel_size = config.nsa_kernel_size
+        self.nsa_kernel_stride = config.nsa_kernel_stride
+        self.nsa_block_size = config.nsa_block_size
+        self.nsa_topk = config.nsa_topk
+        self.nsa_init_blocks = config.nsa_init_blocks
+        self.nsa_local_blocks = config.nsa_local_blocks
 
     def forward(
             self,
@@ -299,16 +306,17 @@ class Qwen3NSAAttention(nn.Module):
             key_states,
             self.nsa_compress_key,
             cu_seqlens,
-            self.kernel_size,
-            self.kernel_stride,
-            self.intra_block_pe,
+            self.nsa_kernel_size,
+            self.nsa_kernel_stride,
+            None,
         )
+        #TODO: intra block PE
         compressed_value_states, _ = self.nsa_compress_func(
             value_states,
             self.nsa_compress_value,
             cu_seqlens,
-            self.kernel_size,
-            self.kernel_stride,
+            self.nsa_kernel_size,
+            self.nsa_kernel_stride,
             None,
         )
         seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -317,20 +325,20 @@ class Qwen3NSAAttention(nn.Module):
             query_states,
             compressed_key_states,
             compressed_value_states,
-            self.kernel_size,
-            self.kernel_stride,
-            self.block_size,
-            self.topk,
+            self.nsa_kernel_size,
+            self.nsa_kernel_stride,
+            self.nsa_block_size,
+            self.nsa_topk,
             cu_seqlens,
             compressed_cu_seqlens,
-            compressed_seqlens.max().item(),
+            seqlens.max().item(),
             compressed_seqlens.max().item(),
             None,
-            self.init_blocks,
-            self.local_blocks,
+            self.nsa_init_blocks,
+            self.nsa_local_blocks,
         )
         sparse_attn_output = topk_sparse_attention(
-            query_states, key_states, value_states, topk_idx, self.config.nsa_block_size, cu_seqlens, None
+            query_states, key_states, value_states, topk_idx, self.nsa_block_size, cu_seqlens, None
         )
         sliding_attn_output = flash_attn_varlen_func(
             query_states,
