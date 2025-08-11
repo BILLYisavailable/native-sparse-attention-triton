@@ -45,7 +45,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import check_model_inputs
 from .configuration_qwen3nsa import Qwen3NSAConfig
-from .native_sparse_attention.module import NativeSparseAttention, RopeConfig, NSACache
+from .native_sparse_attention.module.native_sparse_attention import NativeSparseAttention
+
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
