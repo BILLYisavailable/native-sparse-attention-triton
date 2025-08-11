@@ -45,8 +45,14 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import check_model_inputs
 from .configuration_qwen3nsa import Qwen3NSAConfig
-from native_sparse_attention.module import NativeSparseAttention
-from dataclasses import dataclass, field
+from native_sparse_attention.ops import (
+    compressed_attention,
+    topk_sparse_attention,
+    avgpool_compress,
+    weightedpool_compress,
+    linear_compress,
+)
+from flash_attn import flash_attn_varlen_func
 
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
@@ -83,32 +89,12 @@ class Qwen3MLP(nn.Module):
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
-@dataclass
-class RopeConfig:
-    max_position_embeddings: int = 131072
-    head_dim: int = 128
-    rope_theta: float = 500000
-    rope_scaling: dict = field(
-        default_factory=lambda: {
-            "factor": 8.0,
-            "high_freq_factor": 4.0,
-            "low_freq_factor": 1.0,
-            "original_max_position_embeddings": 8192,
-            "rope_type": "llama3",
-        }
-    )
-    # useless, just for compatibility, please use head_dim instead
-    hidden_size: int = 1
-    num_attention_heads: int = 1
 
-    def __post_init__(self):
-        self.num_attention_heads = 1
-        self.hidden_size = self.head_dim
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -152,14 +138,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs: Unpack[TransformersKwargs],
 ):
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
@@ -176,20 +162,62 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
+
+COMPRESS_TYPE_TO_FUNC = {
+    "avgpool": avgpool_compress,
+    "weightedpool": weightedpool_compress,
+    "linear": linear_compress,
+}
+COMPRESS_TYPE_TO_WEIGHT = {
+    "avgpool": lambda num_heads, head_dim, kernel_size: None,
+    "weightedpool": lambda num_heads, head_dim, kernel_size: torch.nn.Parameter(
+        torch.zeros(num_heads, kernel_size)
+    ),
+    "linear": lambda num_heads, head_dim, kernel_size: torch.nn.Parameter(
+        torch.zeros(num_heads, head_dim * kernel_size, head_dim)
+    ),
+}
+
+
+def batch2cuseqlen(key_states: torch.Tensor, value_states: torch.Tensor, attention_mask: torch.Tensor) -> tuple:
+    batch_size, num_heads, seq_len, head_dim = key_states.shape
+
+    attention_mask = attention_mask.squeeze(1).squeeze(1)
+    seqlen = torch.sum(attention_mask, dim=1)
+    cu_seqlen = torch.cat([torch.tensor([0], dtype=seqlen.dtype), torch.cumsum(seqlen, dim=0)])
+
+    merged_key_states = []
+    merged_value_states = []
+
+    total_seq_len = 0
+    for i in range(batch_size):
+        valid_length = cu_seqlen[i + 1] - cu_seqlen[i]
+        total_seq_len += valid_length
+
+        key_sequence = key_states[i, :, :valid_length, :]
+        value_sequence = value_states[i, :, :valid_length, :]
+        merged_key_states.append(key_sequence)
+        merged_value_states.append(value_sequence)
+
+    merged_key_states = torch.cat(merged_key_states, dim=1)
+    merged_value_states = torch.cat(merged_value_states, dim=1)
+
+    return merged_key_states, merged_value_states, cu_seqlen
+
+
 class Qwen3NSAAttention(nn.Module):
-    """Multi-headed attention with Native Sparse Attention"""
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: Qwen3NSAConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = config.head_dim
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
-        # Projection layers for Q, K, V, and output
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
@@ -202,41 +230,31 @@ class Qwen3NSAAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-
-        # Normalization layers
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
-        # Sliding window for attention (if specified)
+        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
+        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-        self.rope_config = RopeConfig()
-        
-        # Native Sparse Attention
-        self.nsa = NativeSparseAttention(
-            compress_type=config.nsa_compress_type,
-            hidden_size=config.hidden_size,
-            num_q_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=self.head_dim,
-            kernel_size=config.nsa_kernel_size,
-            kernel_stride=config.nsa_kernel_stride,
-            block_size=config.nsa_block_size,
-            topk=config.nsa_topk,
-            init_blocks=config.nsa_init_blocks,
-            local_blocks=config.nsa_local_blocks,
-            window_size=config.nsa_window_size,
-            rope_config=self.rope_config,
+        self.nsa_compress_type = config.nsa_compress_type
+        self.nsa_gate_proj = torch.nn.Sequential(
+            torch.nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim * 3, bias=False),
+            torch.nn.Sigmoid(),
         )
+        self.nsa_compress_key = COMPRESS_TYPE_TO_WEIGHT[self.nsa_compress_type](
+            config.num_key_value_heads, self.head_dim, self.config.nsa_kernel_size
+        )
+        self.nsa_compress_value = COMPRESS_TYPE_TO_WEIGHT[self.nsa_compress_type](
+            config.num_key_value_heads, self.head_dim, self.config.nsa_kernel_size
+        )
+        self.nsa_compress_func = COMPRESS_TYPE_TO_FUNC[self.config.nsa_compress_type]
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ):
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: tuple[torch.Tensor, torch.Tensor],
+            attention_mask: Optional[torch.Tensor],
+            past_key_value: Optional[Cache] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -252,74 +270,131 @@ class Qwen3NSAAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attn_output = self.nsa(query_states, key_states, value_states, attention_mask)
+        # key_states, value_states: [batch_size, head, seqlen, head_dim]
+        # head = 8, 32, head_dim = 128
+        # hidden_states: [batch_size, 1, hidden_size] = [4, 1, 4096]
 
+        # assert self.config._attn_implementation=="flash_attention_2"
+        # attention_interface: Callable = eager_attention_forward
+        # if self.config._attn_implementation != "eager":
+        #     attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        ##TODO: Transform to flash attention
+        ##TODO: Compress first, Flash last
+        # attn_output, attn_weights = eager_attention_forward(
+        #     self,
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     attention_mask,
+        #     dropout=0.0 if not self.training else self.attention_dropout,
+        #     scaling=self.scaling,
+        #     sliding_window=self.sliding_window,  # diff with Llama
+        #     **kwargs,
+        # )
 
+        ##TODO: Cumulate
+        key_states, value_states, cu_seqlens = batch2cuseqlen(key_states, value_states, attention_mask)
+
+        compressed_key_states, compressed_cu_seqlens = self.nsa_compress_func(
+            key_states,
+            self.nsa_compress_key,
+            cu_seqlens,
+            self.kernel_size,
+            self.kernel_stride,
+            self.intra_block_pe,
+        )
+        compressed_value_states, _ = self.nsa_compress_func(
+            value_states,
+            self.nsa_compress_value,
+            cu_seqlens,
+            self.kernel_size,
+            self.kernel_stride,
+            None,
+        )
+        seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+        compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
+        compressed_attn_output, topk_idx = compressed_attention(
+            query_states,
+            compressed_key_states,
+            compressed_value_states,
+            self.kernel_size,
+            self.kernel_stride,
+            self.block_size,
+            self.topk,
+            cu_seqlens,
+            compressed_cu_seqlens,
+            compressed_seqlens.max().item(),
+            compressed_seqlens.max().item(),
+            None,
+            self.init_blocks,
+            self.local_blocks,
+        )
+        sparse_attn_output = topk_sparse_attention(
+            query_states, key_states, value_states, topk_idx, self.config.nsa_block_size, cu_seqlens, None
+        )
+        sliding_attn_output = flash_attn_varlen_func(
+            query_states,
+            key_states,
+            value_states,
+            cu_seqlens,
+            compressed_cu_seqlens,
+            seqlens.max().item(),
+            compressed_seqlens.max().item(),
+            causal=True,
+            window_size=(self.window_size, -1),
+        )
+
+        gate = self.nsa_gate_proj(hidden_states)  # [batch, 1, 32 * 128 * 3] = [4, 1, 12288]
+        gate = gate.view(hidden_states.shape[0], hidden_states.shape[1], self.config.num_attention_heads, self.head_dim,
+                         3)
+        gate = torch.ones(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            self.config.num_attention_heads,
+            self.head_dim,
+            3,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        attn_output = (
+                gate[..., 0:1].squeeze(-1) * compressed_attn_output +
+                gate[..., 1:2].squeeze(-1) * sparse_attn_output +
+                gate[..., 2:3].squeeze(-1) * sliding_attn_output
+        )
+
+        # attn_output: [batch_size, 1, head, head_dim] = [4, 1, 32, 128]
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
 
-    @torch.no_grad()
-    def inference(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        step: int,
-        kv_cache: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ):
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        # Compute query, key, value states for inference
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        # Apply rotary positional embeddings
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        # Update key/value cache if available (important for autoregressive generation)
-        if kv_cache is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        # Use Native Sparse Attention for inference
-        attn_output = self.nsa.inference(query_states, key_states, value_states, step, kv_cache)
-
-        # Reshape and apply output projection
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output
 
 class Qwen3NSADecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3NSAConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+
         self.self_attn = Qwen3NSAAttention(config=config, layer_idx=layer_idx)
+
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **kwargs: Unpack[TransformersKwargs],
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_value: Optional[Cache] = None,
+            use_cache: Optional[bool] = False,
+            cache_position: Optional[torch.LongTensor] = None,
+            position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+            **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states, _ = self.self_attn(
+        hidden_states = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -414,15 +489,15 @@ class Qwen3NSAModel(Qwen3NSAPreTrainedModel):
     @check_model_inputs
     @auto_docstring
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Cache] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            use_cache: Optional[bool] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -509,17 +584,17 @@ class Qwen3NSAForCausalLM(Qwen3NSAPreTrainedModel, GenerationMixin):
     @can_return_tuple
     @auto_docstring
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[TransformersKwargs],
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Cache] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            logits_to_keep: Union[int, torch.Tensor] = 0,
+            **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):

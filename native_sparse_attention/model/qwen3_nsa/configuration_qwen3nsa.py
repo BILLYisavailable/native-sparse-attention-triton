@@ -48,7 +48,7 @@ class Qwen3NSAConfig(PretrainedConfig):
             max_window_layers=28,
             layer_types=None,
             attention_dropout=0.0,
-            nsa_compress_type="weightedpool",  # Add NSA specific parameters
+            nsa_compress_type="avgpool",  # Add NSA specific parameters
             nsa_kernel_size=32,
             nsa_kernel_stride=16,
             nsa_block_size=64,
