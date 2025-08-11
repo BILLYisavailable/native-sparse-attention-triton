@@ -336,15 +336,6 @@ class Qwen3NSAAttention(nn.Module):
         gate = self.nsa_gate_proj(hidden_states)  # [batch, 1, 32 * 128 * 3] = [4, 1, 12288]
         gate = gate.view(hidden_states.shape[0], hidden_states.shape[1], self.config.num_attention_heads, self.head_dim,
                          3)
-        gate = torch.ones(
-            hidden_states.shape[0],
-            hidden_states.shape[1],
-            self.config.num_attention_heads,
-            self.head_dim,
-            3,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
         attn_output = (
                 gate[..., 0:1].squeeze(-1) * compressed_attn_output +
                 gate[..., 1:2].squeeze(-1) * sparse_attn_output +
