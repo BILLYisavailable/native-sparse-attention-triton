@@ -45,7 +45,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.generic import check_model_inputs
 from .configuration_qwen3nsa import Qwen3NSAConfig
-from .native_sparse_attention.module.native_sparse_attention import NativeSparseAttention
+from native_sparse_attention.module import NativeSparseAttention
+from dataclasses import dataclass, field
 
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
@@ -82,7 +83,27 @@ class Qwen3MLP(nn.Module):
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
+@dataclass
+class RopeConfig:
+    max_position_embeddings: int = 131072
+    head_dim: int = 128
+    rope_theta: float = 500000
+    rope_scaling: dict = field(
+        default_factory=lambda: {
+            "factor": 8.0,
+            "high_freq_factor": 4.0,
+            "low_freq_factor": 1.0,
+            "original_max_position_embeddings": 8192,
+            "rope_type": "llama3",
+        }
+    )
+    # useless, just for compatibility, please use head_dim instead
+    hidden_size: int = 1
+    num_attention_heads: int = 1
 
+    def __post_init__(self):
+        self.num_attention_heads = 1
+        self.hidden_size = self.head_dim
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -188,7 +209,8 @@ class Qwen3NSAAttention(nn.Module):
 
         # Sliding window for attention (if specified)
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
-
+        self.rope_config = RopeConfig()
+        
         # Native Sparse Attention
         self.nsa = NativeSparseAttention(
             compress_type=config.nsa_compress_type,
@@ -203,8 +225,7 @@ class Qwen3NSAAttention(nn.Module):
             init_blocks=config.nsa_init_blocks,
             local_blocks=config.nsa_local_blocks,
             window_size=config.nsa_window_size,
-            rope_config=config.rope_scaling,  # Passing rope_config if available
-            rope_device="cuda",  # Assuming it's "cuda", can be customized
+            rope_config=self.rope_config,
         )
 
     def forward(
