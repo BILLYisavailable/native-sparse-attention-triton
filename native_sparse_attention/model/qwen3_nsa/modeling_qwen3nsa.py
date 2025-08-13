@@ -48,12 +48,14 @@ from .configuration_qwen3nsa import Qwen3NSAConfig
 from native_sparse_attention.ops import (
     compressed_attention,
     topk_sparse_attention,
+    topk_sparse_attention_decode,
     avgpool_compress,
     weightedpool_compress,
     linear_compress,
 )
 from flash_attn import flash_attn_varlen_func
-
+from native_sparse_attention.infer import nsa_infer
+from native_sparse_attention.module.kv_cache import NSACache
 
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
@@ -218,6 +220,7 @@ class Qwen3NSAAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim ** -0.5
@@ -239,16 +242,21 @@ class Qwen3NSAAttention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+        self.rope = Qwen3RotaryEmbedding(config=self.config, device="cuda")
+
         self.nsa_compress_type = config.nsa_compress_type
-        # self.nsa_gate_proj = torch.nn.Sequential(
-        #     torch.nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim * 3, bias=False),
-        #     torch.nn.Sigmoid(),
-        # )
+        self.nsa_gate_proj = torch.nn.Sequential(
+            torch.nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim * 3, bias=False),
+            torch.nn.Sigmoid(),
+        )
         self.nsa_compress_key = COMPRESS_TYPE_TO_WEIGHT[self.nsa_compress_type](
             config.num_key_value_heads, self.head_dim, self.config.nsa_kernel_size
         )
         self.nsa_compress_value = COMPRESS_TYPE_TO_WEIGHT[self.nsa_compress_type](
             config.num_key_value_heads, self.head_dim, self.config.nsa_kernel_size
+        )
+        self.nsa_intra_block_pe = torch.nn.Parameter(
+            torch.zeros(self.num_kv_heads, self.kernel_size, self.head_dim)
         )
         self.nsa_compress_func = COMPRESS_TYPE_TO_FUNC[self.nsa_compress_type]
         self.nsa_kernel_size = config.nsa_kernel_size
@@ -270,18 +278,14 @@ class Qwen3NSAAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        print(hidden_states.shape)
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
         if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
+
+
 
         # key_states, value_states: [batch_size, head, seqlen, head_dim]
         # head = 8, 32, head_dim = 128
@@ -289,8 +293,7 @@ class Qwen3NSAAttention(nn.Module):
 
         key_states, cu_seqlens = batch2cuseqlen(key_states, attention_mask)
         value_states, _ = batch2cuseqlen(value_states, attention_mask)
-        query_states, _ = batch2cuseqlen(query_states, attention_mask)
-        print(key_states.shape, value_states.shape, query_states.shape)
+
         key_states = key_states.transpose(0, 1)
         query_states = query_states.transpose(0, 1)
         value_states = value_states.transpose(0, 1)
@@ -300,9 +303,8 @@ class Qwen3NSAAttention(nn.Module):
             cu_seqlens.to(torch.int32),
             self.nsa_kernel_size,
             self.nsa_kernel_stride,
-            None,
+            self.nsa_intra_block_pe,
         )
-        # TODO: intra block PE
         compressed_value_states, _ = self.nsa_compress_func(
             value_states,
             self.nsa_compress_value,
@@ -362,7 +364,6 @@ class Qwen3NSAAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
 
         return attn_output
-
 
 class Qwen3NSADecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3NSAConfig, layer_idx: int):

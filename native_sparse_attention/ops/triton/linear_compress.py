@@ -19,6 +19,7 @@ import torch
 import triton.language as tl
 from einops import rearrange, einsum
 from native_sparse_attention.ops.triton.utils import is_hopper_gpu
+from native_sparse_attention.infer import nsa_infer
 
 IS_HOPPER_GPU = is_hopper_gpu()
 
