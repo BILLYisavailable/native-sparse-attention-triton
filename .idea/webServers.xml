@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="acf2380a-ed29-45ed-a185-76580ce62650" name="120">
+        <fileTransfer rootFolder="/home/adminad/wyx" accessType="SFTP" host="223.72.199.120" port="60022" sshConfigId="c2bd3cc7-6c9c-46f4-a3cd-1d4db4e5021a" sshConfig="adminad@223.72.199.120:60022 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="30000" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
